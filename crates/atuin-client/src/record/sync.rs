@@ -5,7 +5,11 @@ use eyre::Result;
 use thiserror::Error;
 
 use super::{encryption::PASETO_V4, sqlite_store::SqliteStore};
-use crate::{api_client::Client, settings::Settings};
+use crate::{
+    api_client::Client,
+    packfile::{PACKFILE_TAG, download_packed_many, upload_packed_many},
+    settings::Settings,
+};
 
 use atuin_domain::record::{Diff, HostId, RecordId, RecordIdx, RecordStatus};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
@@ -157,16 +161,23 @@ pub async fn operations(
     // with the same properties
 
     operations.sort_by_key(|op| match op {
-        Operation::Noop { host, tag } => (0, *host, tag.clone()),
-
-        Operation::Upload { host, tag, .. } => (1, *host, tag.clone()),
-
-        Operation::Download { host, tag, .. } => (2, *host, tag.clone()),
+        Operation::Noop { host, tag } => (0u8, *host, 0u8, tag.clone()),
+        Operation::Upload { host, tag, .. } => (1u8, *host, 0u8, tag.clone()),
+        Operation::Download { host, tag, .. } => {
+            // Packfile manifests must expand before the history download runs, so the history
+            // records they populate are skipped by the live-head dedup in sync_download.
+            let tag_priority = if tag == PACKFILE_TAG { 0u8 } else { 1u8 };
+            (2u8, *host, tag_priority, tag.clone())
+        }
     });
 
     Ok(operations)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threading the key for bundle uploads pushes this one param over the limit"
+)]
 async fn sync_upload(
     store: &SqliteStore,
     client: &Client<'_>,
@@ -175,6 +186,7 @@ async fn sync_upload(
     local: RecordIdx,
     remote: Option<RecordIdx>,
     page_size: u64,
+    key: &[u8; 32],
 ) -> Result<i64, SyncError> {
     let remote = remote.unwrap_or(0);
     let expected = local - remote;
@@ -207,6 +219,21 @@ async fn sync_upload(
             break;
         }
 
+        // Ship the page's bundle blobs *before* posting the manifest records, so a manifest
+        // that reaches the server always has its bundle. Each blob references history records
+        // already uploaded (the `history` tag sorts before `packfile`) plus its own manifest's
+        // identity, so the bundles are independent -- `upload_packed_many` ships them in bounded
+        // concurrent batches. A bundle failure fails this page, which retries cleanly next sync
+        // (the manifest records here were not posted).
+        if tag == PACKFILE_TAG {
+            upload_packed_many(&page, store, key, client)
+                .await
+                .map_err(|e| {
+                    error!("failed to upload packfile bundles: {e:?}");
+                    SyncError::RemoteRequestError { msg: e.to_string() }
+                })?;
+        }
+
         client.post_records(&page).await.map_err(|e| {
             error!("failed to post records: {e:?}");
 
@@ -226,6 +253,10 @@ async fn sync_upload(
     Ok(progress as i64)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threading the key for bundle downloads pushes this one param over the limit"
+)]
 async fn sync_download(
     store: &SqliteStore,
     client: &Client<'_>,
@@ -234,9 +265,23 @@ async fn sync_download(
     local: Option<RecordIdx>,
     remote: RecordIdx,
     page_size: u64,
+    key: &[u8; 32],
 ) -> Result<Vec<RecordId>, SyncError> {
-    let local = local.unwrap_or(0);
-    let expected = remote - local;
+    // Re-derive the local head from the store at execution time. An earlier packfile expansion in
+    // this same sync may have populated records for this (host, tag); starting from the frozen
+    // diff value would re-download the range those bundles already covered.
+    // Note: as with the pre-existing incremental-download boundary behavior below, the record at
+    // idx == this re-derived `local` gets re-requested by the first loose page (start = local +
+    // 0); that's harmless since `push_batch` is an insert-or-ignore upsert on id.
+    let local = match store.last(host, &tag).await {
+        Ok(Some(record)) => record.idx.max(local.unwrap_or(0)),
+        Ok(None) => local.unwrap_or(0),
+        Err(e) => return Err(SyncError::LocalStoreError { msg: e.to_string() }),
+    };
+    // Saturating: the live-derived `local` head (above) can exceed the `remote` snapshot taken at
+    // the start of `sync()` if a concurrent upload from another device landed in between -- a
+    // plain subtraction would underflow (panic in debug, wrap in release).
+    let expected = remote.saturating_sub(local);
     let mut progress = 0;
     let mut ret = Vec::new();
 
@@ -261,6 +306,21 @@ async fn sync_download(
 
         if page.is_empty() {
             break;
+        }
+
+        // For packfile manifests, ship the bundle's history into the local store BEFORE we
+        // persist the manifests -- so a manifest we record locally always has its history, and a
+        // failed expansion leaves the manifests un-persisted to retry next sync (dual of upload).
+        if tag == PACKFILE_TAG {
+            let expanded = download_packed_many(&page, store, key, client)
+                .await
+                .map_err(|e| {
+                    error!("failed to download packfile bundles: {e:?}");
+                    SyncError::RemoteRequestError { msg: e.to_string() }
+                })?;
+            // The expanded HISTORY ids must flow to `downloaded` so history.db's id-driven
+            // incremental_build indexes them (the manifests are non-HISTORY_TAG, skipped there).
+            ret.extend(expanded);
         }
 
         store
@@ -288,6 +348,7 @@ pub async fn sync_remote(
     operations: Vec<Operation>,
     local_store: &SqliteStore,
     page_size: u64,
+    key: &[u8; 32],
 ) -> Result<(i64, Vec<RecordId>), SyncError> {
     let mut uploaded = 0;
     let mut downloaded = Vec::new();
@@ -301,8 +362,17 @@ pub async fn sync_remote(
                 local,
                 remote,
             } => {
-                uploaded +=
-                    sync_upload(local_store, client, host, tag, local, remote, page_size).await?
+                uploaded += sync_upload(
+                    local_store,
+                    client,
+                    host,
+                    tag,
+                    local,
+                    remote,
+                    page_size,
+                    key,
+                )
+                .await?
             }
 
             Operation::Download {
@@ -311,8 +381,17 @@ pub async fn sync_remote(
                 local,
                 remote,
             } => {
-                let mut d =
-                    sync_download(local_store, client, host, tag, local, remote, page_size).await?;
+                let mut d = sync_download(
+                    local_store,
+                    client,
+                    host,
+                    tag,
+                    local,
+                    remote,
+                    page_size,
+                    key,
+                )
+                .await?;
                 downloaded.append(&mut d)
             }
 
@@ -366,7 +445,8 @@ pub async fn sync(
     check_encryption_key(&client, &remote_index, encryption_key).await?;
 
     let operations = operations(diff, store).await?;
-    let (uploaded, downloaded) = sync_remote(&client, operations, store, 100).await?;
+    let (uploaded, downloaded) =
+        sync_remote(&client, operations, store, 100, encryption_key).await?;
 
     Ok((uploaded, downloaded))
 }
@@ -659,5 +739,379 @@ mod tests {
         });
 
         assert_eq!(result_ops, operations);
+    }
+}
+
+#[cfg(test)]
+mod packfile_download_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use atuin_common::utils::uuid_v7;
+    use atuin_domain::record::{DecryptedData, EncryptedData, Host, HostId, Record};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::api_client::{AuthToken, Client};
+    use crate::history::HISTORY_TAG;
+    use crate::packfile::{PACKFILE_TAG, try_pack};
+    use crate::packfile::{PackManifestRef, pack};
+    use crate::record::encryption::PASETO_V4;
+    use crate::record::sqlite_store::SqliteStore;
+    use crate::settings::test_local_timeout;
+
+    #[tokio::test]
+    async fn sync_download_expands_packfile_manifests_into_history() {
+        let key = [4u8; 32];
+        let host = HostId(uuid_v7());
+
+        // Uploader-side artifacts: history + manifest + blob.
+        let up = SqliteStore::new(":memory:", test_local_timeout())
+            .await
+            .unwrap();
+        for idx in 0..3u64 {
+            let r = Record::builder()
+                .host(Host::new(host))
+                .version("v1".into())
+                .tag(HISTORY_TAG.to_owned())
+                .idx(idx)
+                .data(DecryptedData(format!("cmd {idx}").into_bytes()))
+                .build()
+                .encrypt::<PASETO_V4>(&key);
+            up.push(&r).await.unwrap();
+        }
+        try_pack(&up, host, 1..=3, HISTORY_TAG).await.unwrap();
+        let manifest = up.last(host, PACKFILE_TAG).await.unwrap().unwrap();
+        let run = up.next(host, HISTORY_TAG, 0, 3).await.unwrap();
+        let decrypted: Vec<_> = run
+            .into_iter()
+            .map(|r| r.decrypt::<PASETO_V4>(&key).unwrap())
+            .collect();
+        let blob = pack(&decrypted, &PackManifestRef::from(&manifest), &key).unwrap();
+
+        let server = MockServer::start().await;
+        // First page: the manifest. Second page (start advanced): empty -> loop ends.
+        Mock::given(method("GET"))
+            .and(path("/api/v0/record/next"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![manifest.clone()]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/record/next"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Vec::<Record<EncryptedData>>::new()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v0/bundles/{}", manifest.id.0)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "download_url": format!("{}/download/abc", server.uri()) })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+            .mount(&server)
+            .await;
+
+        let down = SqliteStore::new(":memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let sync_addr: url::Url = server.uri().parse().unwrap();
+        let client = Client::new(
+            &sync_addr,
+            AuthToken::Token("t".into()),
+            30,
+            30,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        sync_download(
+            &down,
+            &client,
+            host,
+            PACKFILE_TAG.to_owned(),
+            None,
+            1,
+            100,
+            &key,
+        )
+        .await
+        .unwrap();
+
+        // The manifest is stored AND the history it covers was populated.
+        assert!(down.last(host, PACKFILE_TAG).await.unwrap().is_some());
+        assert_eq!(down.next(host, HISTORY_TAG, 0, 3).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sync_download_returns_expanded_history_ids_for_indexing() {
+        let key = [6u8; 32];
+        let host = HostId(uuid_v7());
+
+        let up = SqliteStore::new(":memory:", test_local_timeout())
+            .await
+            .unwrap();
+        for idx in 0..3u64 {
+            let r = Record::builder()
+                .host(Host::new(host))
+                .version("v1".into())
+                .tag(HISTORY_TAG.to_owned())
+                .idx(idx)
+                .data(DecryptedData(format!("cmd {idx}").into_bytes()))
+                .build()
+                .encrypt::<PASETO_V4>(&key);
+            up.push(&r).await.unwrap();
+        }
+        try_pack(&up, host, 1..=3, HISTORY_TAG).await.unwrap();
+        let manifest = up.last(host, PACKFILE_TAG).await.unwrap().unwrap();
+        let run = up.next(host, HISTORY_TAG, 0, 3).await.unwrap();
+        let history_ids: Vec<_> = run.iter().map(|r| r.id).collect();
+        let decrypted: Vec<_> = run
+            .into_iter()
+            .map(|r| r.decrypt::<PASETO_V4>(&key).unwrap())
+            .collect();
+        let blob = pack(&decrypted, &PackManifestRef::from(&manifest), &key).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/record/next"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![manifest.clone()]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/record/next"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Vec::<Record<EncryptedData>>::new()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v0/bundles/{}", manifest.id.0)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "download_url": format!("{}/download/abc", server.uri()) })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+            .mount(&server)
+            .await;
+
+        let down = SqliteStore::new(":memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let sync_addr: url::Url = server.uri().parse().unwrap();
+        let client = Client::new(
+            &sync_addr,
+            AuthToken::Token("t".into()),
+            30,
+            30,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let returned = sync_download(
+            &down,
+            &client,
+            host,
+            PACKFILE_TAG.to_owned(),
+            None,
+            1,
+            100,
+            &key,
+        )
+        .await
+        .unwrap();
+
+        for id in &history_ids {
+            assert!(
+                returned.contains(id),
+                "expanded history id {id:?} must be returned for indexing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_download_skips_the_range_a_bundle_covered() {
+        let key = [5u8; 32];
+        let host = HostId(uuid_v7());
+
+        let up = SqliteStore::new(":memory:", test_local_timeout())
+            .await
+            .unwrap();
+        for idx in 0..3u64 {
+            let r = Record::builder()
+                .host(Host::new(host))
+                .version("v1".into())
+                .tag(HISTORY_TAG.to_owned())
+                .idx(idx)
+                .data(DecryptedData(format!("cmd {idx}").into_bytes()))
+                .build()
+                .encrypt::<PASETO_V4>(&key);
+            up.push(&r).await.unwrap();
+        }
+        try_pack(&up, host, 1..=3, HISTORY_TAG).await.unwrap();
+        let manifest = up.last(host, PACKFILE_TAG).await.unwrap().unwrap();
+        let run = up.next(host, HISTORY_TAG, 0, 3).await.unwrap();
+        let decrypted: Vec<_> = run
+            .into_iter()
+            .map(|r| r.decrypt::<PASETO_V4>(&key).unwrap())
+            .collect();
+        let blob = pack(&decrypted, &PackManifestRef::from(&manifest), &key).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/record/next"))
+            .and(query_param("tag", PACKFILE_TAG))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![manifest.clone()]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/record/next"))
+            .and(query_param("tag", PACKFILE_TAG))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Vec::<Record<EncryptedData>>::new()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v0/bundles/{}", manifest.id.0)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "download_url": format!("{}/download/abc", server.uri()) })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+            .mount(&server)
+            .await;
+        // Loose history endpoint: record any hit so we can assert the covered range is skipped.
+        Mock::given(method("GET"))
+            .and(path("/api/v0/record/next"))
+            .and(query_param("tag", HISTORY_TAG))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Vec::<Record<EncryptedData>>::new()),
+            )
+            .mount(&server)
+            .await;
+
+        let down = SqliteStore::new(":memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let sync_addr: url::Url = server.uri().parse().unwrap();
+        let client = Client::new(
+            &sync_addr,
+            AuthToken::Token("t".into()),
+            30,
+            30,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        // Packfile op first (populates history 0..=2), then the history op.
+        sync_download(
+            &down,
+            &client,
+            host,
+            PACKFILE_TAG.to_owned(),
+            None,
+            1,
+            100,
+            &key,
+        )
+        .await
+        .unwrap();
+        sync_download(
+            &down,
+            &client,
+            host,
+            HISTORY_TAG.to_owned(),
+            None,
+            3,
+            100,
+            &key,
+        )
+        .await
+        .unwrap();
+
+        // The history download must have started AFTER the bundled prefix (idx 2), i.e. never
+        // requested start=0 for HISTORY_TAG.
+        let requests = server.received_requests().await.unwrap();
+        let requested_history_start_0 = requests.iter().any(|r| {
+            r.url.path() == "/api/v0/record/next"
+                && r.url
+                    .query_pairs()
+                    .any(|(k, v)| k == "tag" && v == HISTORY_TAG)
+                && r.url.query_pairs().any(|(k, v)| k == "start" && v == "0")
+        });
+        assert!(
+            !requested_history_start_0,
+            "bundled history range must not be re-requested loose"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_download_does_not_underflow_when_local_head_exceeds_remote() {
+        let key = [7u8; 32];
+        let host = HostId(uuid_v7());
+
+        // Local store already has HISTORY [0..=4] (head idx 4).
+        let down = SqliteStore::new(":memory:", test_local_timeout())
+            .await
+            .unwrap();
+        for idx in 0..5u64 {
+            let r = Record::builder()
+                .host(Host::new(host))
+                .version("v1".into())
+                .tag(HISTORY_TAG.to_owned())
+                .idx(idx)
+                .data(DecryptedData(format!("cmd {idx}").into_bytes()))
+                .build()
+                .encrypt::<PASETO_V4>(&key);
+            down.push(&r).await.unwrap();
+        }
+
+        // Server that returns empty for any record page (nothing new to fetch).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/record/next"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Vec::<Record<EncryptedData>>::new()),
+            )
+            .mount(&server)
+            .await;
+        let sync_addr: url::Url = server.uri().parse().unwrap();
+        let client = Client::new(
+            &sync_addr,
+            AuthToken::Token("t".into()),
+            30,
+            30,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        // remote (2) is BEHIND the live local head (4) -- must not underflow/panic.
+        let got = sync_download(
+            &down,
+            &client,
+            host,
+            HISTORY_TAG.to_owned(),
+            Some(0),
+            2,
+            100,
+            &key,
+        )
+        .await
+        .unwrap();
+        assert!(
+            got.is_empty(),
+            "nothing to download when local head already exceeds remote"
+        );
     }
 }

@@ -23,6 +23,7 @@ pub mod logout;
 pub mod logs;
 pub mod meta;
 pub mod ordering;
+pub mod packfile;
 pub mod plugin;
 pub mod record;
 pub mod secrets;

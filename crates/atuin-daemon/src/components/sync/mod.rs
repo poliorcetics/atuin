@@ -22,6 +22,13 @@ use crate::{
     events::DaemonEvent,
 };
 
+/// The record stores rebuilt after each successful sync.
+struct Stores {
+    history: HistoryStore,
+    alias: AliasStore,
+    var: VarStore,
+}
+
 /// Commands that can be sent to the sync task.
 enum SyncCommand {
     /// Trigger an immediate sync.
@@ -126,9 +133,11 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
 
     // Create the stores we need
     let encryption_key = *handle.encryption_key();
-    let history_store = HistoryStore::new(handle.store().clone(), host_id, encryption_key);
-    let alias_store = AliasStore::new(handle.store().clone(), host_id, encryption_key);
-    let var_store = VarStore::new(handle.store().clone(), host_id, encryption_key);
+    let stores = Stores {
+        history: HistoryStore::new(handle.store().clone(), host_id, encryption_key),
+        alias: AliasStore::new(handle.store().clone(), host_id, encryption_key),
+        var: VarStore::new(handle.store().clone(), host_id, encryption_key),
+    };
 
     // Don't backoff by more than 30 mins (with a random jitter of up to 1 min)
     let max_interval: f64 = 60.0 * 30.0 + rand::thread_rng().gen_range(0.0..60.0);
@@ -155,9 +164,7 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
 
                 sync_state = do_sync_tick(
                     &handle,
-                    &history_store,
-                    &alias_store,
-                    &var_store,
+                    &stores,
                     &mut ticker,
                     max_interval,
                     &settings,
@@ -170,9 +177,7 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
                         let settings = handle.settings().await;
                         sync_state = do_sync_tick(
                             &handle,
-                            &history_store,
-                            &alias_store,
-                            &var_store,
+                            &stores,
                             &mut ticker,
                             max_interval,
                             &settings,
@@ -193,9 +198,7 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
 /// Returns the new sync state: `Idle` on success, `Retrying` on failure.
 async fn do_sync_tick(
     handle: &DaemonHandle,
-    history_store: &HistoryStore,
-    alias_store: &AliasStore,
-    var_store: &VarStore,
+    stores: &Stores,
     ticker: &mut time::Interval,
     max_interval: f64,
     settings: &Settings,
@@ -260,7 +263,8 @@ async fn do_sync_tick(
                 "sync complete"
             );
 
-            let batches = history_store
+            let batches = stores
+                .history
                 .incremental_build(handle.history_db(), &downloaded_records)
                 // intentional try_chunks -- legacy behavior was to abort on the first error.
                 .try_chunks(HISTORY_BATCH_SIZE);
@@ -291,10 +295,10 @@ async fn do_sync_tick(
             });
 
             // Rebuild alias and var stores
-            if let Err(e) = alias_store.build().await {
+            if let Err(e) = stores.alias.build().await {
                 tracing::error!("failed to rebuild alias store: {e}");
             }
-            if let Err(e) = var_store.build().await {
+            if let Err(e) = stores.var.build().await {
                 tracing::error!("failed to rebuild var store: {e}");
             }
 

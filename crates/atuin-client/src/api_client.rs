@@ -10,10 +10,11 @@ use reqwest::{
 
 use atuin_common::url::UrlAppendExt;
 use atuin_domain::api::{
-    ATUIN_CARGO_VERSION, ATUIN_HEADER_VERSION, ATUIN_VERSION, ChangePasswordRequest, ErrorResponse,
-    LoginRequest, LoginResponse, MeResponse, RegisterResponse,
+    ATUIN_CARGO_VERSION, ATUIN_HEADER_VERSION, ATUIN_VERSION, BundleDownloadResponse,
+    BundleResponse, ChangePasswordRequest, ErrorResponse, LoginRequest, LoginResponse, MeResponse,
+    RegisterResponse,
 };
-use atuin_domain::record::{EncryptedData, HostId, Record, RecordIdx, RecordStatus};
+use atuin_domain::record::{EncryptedData, HostId, Record, RecordId, RecordIdx, RecordStatus};
 
 use semver::Version;
 
@@ -48,6 +49,9 @@ impl AuthToken {
 pub struct Client<'a> {
     sync_addr: &'a Url,
     client: reqwest::Client,
+    /// Carries no default headers: S3 rejects presigned requests that also carry an
+    /// Authorization header.
+    upload_client: reqwest::Client,
 }
 
 /// A [`reqwest::ClientBuilder`] appropriate for the given extra headers.
@@ -262,6 +266,10 @@ impl<'a> Client<'a> {
                 .connect_timeout(Duration::from_secs(connect_timeout))
                 .timeout(Duration::from_secs(timeout))
                 .build()?,
+            upload_client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(connect_timeout))
+                .timeout(Duration::from_secs(timeout))
+                .build()?,
         })
     }
 
@@ -295,6 +303,61 @@ impl<'a> Client<'a> {
         handle_resp_error(resp).await?;
 
         Ok(())
+    }
+
+    /// Ask the server to create a bundle from already-uploaded records; returns the
+    /// presigned upload URL and the server's bundle id.
+    pub async fn create_bundle(
+        &self,
+        record_ids: &[RecordId],
+        bundle_size_bytes: usize,
+    ) -> Result<(Url, RecordId)> {
+        let url = self.sync_addr.append_path("api/v0/bundles")?;
+        let body = serde_json::json!({
+            "records": record_ids,
+            "bundle_size_bytes": bundle_size_bytes,
+        });
+        let resp = self.client.post(url).json(&body).send().await?;
+        let resp = handle_resp_error(resp).await?;
+
+        let parsed: BundleResponse = resp.json().await?;
+        Ok((parsed.upload_url, parsed.bundle_id))
+    }
+
+    /// Upload a packfile body to a presigned URL. Unauthenticated by design.
+    pub async fn put_packfile(&self, upload_url: &Url, body: Vec<u8>) -> Result<()> {
+        // Not self.client: S3 rejects presigned requests that also carry an Authorization header.
+        let resp = self
+            .upload_client
+            .put(upload_url.clone())
+            .body(body)
+            .send()
+            .await?;
+        handle_resp_error(resp).await?;
+        Ok(())
+    }
+
+    /// Ask the server for the presigned URL to download a bundle, addressed by its
+    /// manifest's record id.
+    pub async fn download_bundle(&self, manifest_id: RecordId) -> Result<Url> {
+        // `append_path` takes `&'static str`; the manifest id is dynamic, so inline its logic.
+        let path = format!("api/v0/bundles/{}", manifest_id.0);
+        let url = self
+            .sync_addr
+            .append(path.split('/').filter(|s| !s.is_empty()))?;
+        let resp = self.client.get(url).send().await?;
+        let resp = handle_resp_error(resp).await?;
+
+        let parsed: BundleDownloadResponse = resp.json().await?;
+        Ok(parsed.download_url)
+    }
+
+    /// Download a packfile body from a presigned URL. Unauthenticated by design (S3 rejects
+    /// presigned requests that also carry an Authorization header).
+    pub async fn get_packfile(&self, download_url: &Url) -> Result<Vec<u8>> {
+        let resp = self.upload_client.get(download_url.clone()).send().await?;
+        let resp = handle_resp_error(resp).await?;
+        Ok(resp.bytes().await?.to_vec())
     }
 
     pub async fn next_records(
@@ -493,5 +556,64 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.url().path(), "/ok");
+    }
+}
+
+#[cfg(test)]
+mod bundle_download_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn download_bundle_returns_the_presigned_url() {
+        let server = MockServer::start().await;
+        let manifest_id = RecordId(atuin_common::utils::uuid_v7());
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v0/bundles/{}", manifest_id.0)))
+            .and(|req: &wiremock::Request| req.headers.get("authorization").is_some())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "download_url": format!("{}/download/abc", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+
+        let sync_addr: url::Url = server.uri().parse().unwrap();
+        let client = Client::new(
+            &sync_addr,
+            AuthToken::Token("t".into()),
+            30,
+            30,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let url = client.download_bundle(manifest_id).await.unwrap();
+        assert_eq!(url.path(), "/download/abc");
+    }
+
+    #[tokio::test]
+    async fn get_packfile_fetches_bytes_without_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/abc"))
+            .and(|req: &wiremock::Request| req.headers.get("authorization").is_none())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"packed".to_vec()))
+            .mount(&server)
+            .await;
+
+        let sync_addr: url::Url = server.uri().parse().unwrap();
+        let client = Client::new(
+            &sync_addr,
+            AuthToken::Token("t".into()),
+            30,
+            30,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let url = format!("{}/download/abc", server.uri()).parse().unwrap();
+
+        let bytes = client.get_packfile(&url).await.unwrap();
+        assert_eq!(bytes, b"packed");
     }
 }
