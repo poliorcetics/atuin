@@ -95,8 +95,42 @@ fn exec_fallback_shell(shell: Option<&Path>) -> ! {
     std::process::exit(1);
 }
 
+/// Startup timing breadcrumbs behind `ATUIN_PTY_PROXY_TRACE=1`, to place
+/// environment-specific stalls without a debugger attached.
+struct Trace {
+    enabled: bool,
+    start: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl Trace {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            enabled: crate::pty_proxy::env_flag("ATUIN_PTY_PROXY_TRACE"),
+            start: now,
+            last: now,
+        }
+    }
+
+    fn step(&mut self, name: &str) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        eprintln!(
+            "atuin pty-proxy: trace: {name}: +{:?} (total {:?})\r",
+            now - self.last,
+            now - self.start
+        );
+        self.last = now;
+    }
+}
+
 fn start(mut options: RuntimeOptions) -> eyre::Result<Session> {
+    let mut trace = Trace::new();
     let (cols, rows) = terminal::size().wrap_err("query terminal size")?;
+    trace.step("terminal size");
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -108,6 +142,7 @@ fn start(mut options: RuntimeOptions) -> eyre::Result<Session> {
         })
         .map_err(|e| eyre::eyre!("{e:#}"))
         .wrap_err("open pty")?;
+    trace.step("open pty");
 
     let sock_path = screen::socket_path();
     let _ = std::fs::remove_file(&sock_path);
@@ -146,6 +181,7 @@ fn start(mut options: RuntimeOptions) -> eyre::Result<Session> {
             .map_err(|e| eyre::eyre!("{e:#}"))
             .wrap_err("spawn shell")?,
     ));
+    trace.step("spawn shell");
 
     drop(pair.slave);
 
@@ -177,6 +213,7 @@ fn start(mut options: RuntimeOptions) -> eyre::Result<Session> {
     screen::spawn_socket_server(sock_path.clone(), compositor.clone());
     spawn_resize_handler(pair.master, compositor.clone(), current_cols.clone())
         .wrap_err("install resize handler")?;
+    trace.step("socket + resize handlers");
 
     let (mut input_tracker, key_filter) = options
         .hooks
@@ -189,8 +226,11 @@ fn start(mut options: RuntimeOptions) -> eyre::Result<Session> {
         })
         .unzip();
 
+    trace.step("suggestion hooks");
     terminal::enable_raw_mode().wrap_err("enable raw mode")?;
+    trace.step("raw mode");
     seed_cursor_from_terminal(&compositor, &mut pty_writer);
+    trace.step("cursor handshake");
 
     let pump_compositor = compositor;
     let stdout_thread = std::thread::spawn(move || {
@@ -206,6 +246,8 @@ fn start(mut options: RuntimeOptions) -> eyre::Result<Session> {
             match pty_reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    trace.step("first pty output");
+                    trace.enabled = false;
                     if let (Some(tracker), Some(sink)) = (
                         capture_tracker.as_mut(),
                         options.hooks.command_capture_sink.as_ref(),
