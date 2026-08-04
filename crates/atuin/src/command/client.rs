@@ -27,7 +27,7 @@ mod info;
 mod init;
 mod kv;
 mod scripts;
-mod search;
+pub(super) mod search;
 mod setup;
 mod stats;
 mod store;
